@@ -105,6 +105,31 @@
     <div class="nav-links">
         <a href="/config">Configuration Settings</a>
     </div>
+<h2>Download Metrics</h2>
+
+<form method="get" action="{{ url_for('download_data') }}">
+  <div>
+    <label for="start">Start time:</label>
+    <input type="datetime-local" id="start" name="start" required>
+  </div>
+
+  <div>
+    <label for="end">End time:</label>
+    <input type="datetime-local" id="end" name="end" required>
+  </div>
+
+  <div>
+    <label for="interval">Interval:</label>
+    <select id="interval" name="interval">
+      <option value="">All intervals</option>
+      <option value="interval1">Interval 1</option>
+      <option value="interval2">Interval 2</option>
+      <option value="interval3">Interval 3</option>
+    </select>
+  </div>
+
+  <button type="submit">Download CSV</button>
+</form>
 
     <div class="dashboard-container">
         <div class="chart-controls">
