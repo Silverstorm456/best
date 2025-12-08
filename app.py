@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response
 import sqlite3
 from datetime import datetime, timedelta
 import time
@@ -6,6 +6,8 @@ from threading import Thread
 from collections import defaultdict
 from Sensor import Sensor
 import math
+import io
+import csv
 
 #Flask app
 app = Flask(__name__)
@@ -402,6 +404,93 @@ def get_data(interval):
             
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+@app.route('/download')
+def download_data():
+    # Get query parameters from URL
+    start = request.args.get("start")
+    end = request.args.get("end")
+    interval = request.args.get("interval")  # optional: interval1/interval2/interval3
+
+    if not start or not end:
+        return "Missing 'start' or 'end' query parameter", 400
+
+    # Browser datetime-local format: 'YYYY-MM-DDTHH:MM'
+    # Your DB format: 'YYYY-MM-DD HH:MM:SS'
+    start_str = start.replace("T", " ")
+    end_str = end.replace("T", " ")
+
+    # If seconds are missing, add ':00'
+    if len(start_str) == 16:
+        start_str += ":00"
+    if len(end_str) == 16:
+        end_str += ":00"
+
+    # Base query
+    query = """
+        SELECT timestamp, temp1, temp2,
+               pressure1, pressure2,
+               power, kw_ton, cooling_tons,
+               flow_rate, interval
+        FROM metrics
+        WHERE timestamp BETWEEN ? AND ?
+    """
+    params = [start_str, end_str]
+
+    # Optional interval filter
+    if interval in ("interval1", "interval2", "interval3"):
+        query += " AND interval = ?"
+        params.append(interval)
+
+    # Query database
+    conn = sqlite3.connect('metrics.db')
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    # Build CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Header row
+    writer.writerow([
+        "timestamp", "temp1", "temp2",
+        "pressure1", "pressure2",
+        "power", "kw_ton", "cooling_tons",
+        "flow_rate", "interval"
+    ])
+
+    # Data rows
+    for row in rows:
+        writer.writerow([
+            row["timestamp"],
+            row["temp1"],
+            row["temp2"],
+            row["pressure1"],
+            row["pressure2"],
+            row["power"],
+            row["kw_ton"],
+            row["cooling_tons"],
+            row["flow_rate"],
+            row["interval"]
+        ])
+
+    csv_data = output.getvalue()
+    output.close()
+
+    # Create a safe filename
+    safe_start = start_str.replace(" ", "_").replace(":", "-")
+    safe_end = end_str.replace(" ", "_").replace(":", "-")
+    filename = f"metrics_{safe_start}_to_{safe_end}.csv"
+
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        },
+    )
 
 def cleanup_old_data():
     while True:
