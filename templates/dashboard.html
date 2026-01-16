@@ -102,6 +102,21 @@
 </head>
 
 <body>
+    <div id="diagBox" style="
+    padding: 12px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    margin: 12px 0;
+    background: #fafafa;
+">
+  <div><b>Status:</b> <span id="diagSeverity">—</span></div>
+  <div><b>State:</b> <span id="diagState">—</span></div>
+  <div><b>Summary:</b> <span id="diagSummary">—</span></div>
+  <div><b>Flags:</b>
+    <ul id="diagFlags" style="margin: 6px 0 0 18px;"></ul>
+  </div>
+</div>
+
     <div class="nav-links">
         <a href="/config">Configuration Settings</a>
     </div>
@@ -133,6 +148,26 @@
 
     <div class="dashboard-container">
         <div class="chart-controls">
+                        <!-- Demo Scenario Selector -->
+            <div class="control-group">
+                <label>Demo Scenario:</label>
+                <select id="scenarioSelect">
+                    <option value="normal">Normal</option>
+                    <option value="poor_efficiency">Poor efficiency (high kW/ton)</option>
+                    <option value="no_flow">No flow (ΔP ~ 0)</option>
+                    <option value="sensor_stuck">Sensor stuck (flatline)</option>
+                    <option value="noisy">Noisy sensor (spikes)</option>
+                </select>
+                <div id="scenarioStatus" style="font-size: 12px; opacity: 0.8;">Scenario: —</div>
+            </div>
+            <div class="control-group">
+            <label>View Preset:</label>
+            <select id="viewPreset">
+                <option value="custom">Custom</option>
+                <option value="econ_curve">Economizer Curve (MAT vs OAT)</option>
+            </select>
+            </div>
+
             <div class="control-group">
                 <label>Time Interval:</label>
                 <select id="intervalSelect">
@@ -145,6 +180,7 @@
                 <label>X-Axis Metric:</label>
                 <select id="xAxisSelect">
                     <option value="timestamps">Time</option>
+                    <option value="oat">Outdoor Air Temp (OAT)</option>
                     <option value="cooling_tons">Cooling Tons</option>
                 </select>
             </div>
@@ -155,6 +191,9 @@
                     <option value="diff_pressure">Differential Pressure</option>
                     <option value="diff_temp">Differential Temperature</option>
                     <option value="flow_rate">Flow Rate</option>
+                    <option value="mat">Mixed Air Temp (MAT)</option>
+                    <option value="oat">Outdoor Air Temp (OAT)</option>
+
                 </select>
             </div>
         </div>
@@ -183,26 +222,85 @@
             'diff_temp': 'Differential Temperature',
             'flow_rate': 'Flow Rate',
             'cooling_tons': 'Cooling Tons',
-            'timestamps': 'Time'
+            'timestamps': 'Time',
+            'oat': 'Outdoor Air Temp (OAT)',
+            'mat': 'Mixed Air Temp (MAT)',
+
         };
+        // ---- Ideal/Expected targets (edit these anytime) ----
+// If a metric is not listed here, we'll fall back to using the median of the current window.
+const IDEAL_TARGETS = {
+    kw_ton: 1.0,            // target kW/ton (demo default)
+    // diff_pressure: 0.8,   // optional: set a real target if you know it
+    // diff_temp: 12.0,      // optional
+    // flow_rate: 1200.0     // optional
+};
 
-        function showError(message) {
-            const errorDiv = document.getElementById('errorMessage');
-            errorDiv.textContent = message;
-            errorDiv.style.display = 'block';
+function medianOfArray(arr) {
+    const nums = arr.map(v => parseFloat(v)).filter(v => Number.isFinite(v));
+    if (nums.length === 0) return null;
+    nums.sort((a, b) => a - b);
+    return nums[Math.floor(nums.length / 2)];
+}
+                function showError(message) {
+                    const errorDiv = document.getElementById('errorMessage');
+                    errorDiv.textContent = message;
+                    errorDiv.style.display = 'block';
+                }
+
+                function hideError() {
+                    document.getElementById('errorMessage').style.display = 'none';
+                }
+
+                function destroyChart() {
+                    if (currentChart) {
+                        currentChart.destroy();
+                        currentChart = null;
+                    }
+                }
+        function buildIdealOverlayData(xMetric, yMetric) {
+            if (!currentData || !currentData.timestamps || currentData.timestamps.length === 0) return [];
+
+            // Special-case: Economizer curve view (MAT vs OAT) -> ideal = MAT setpoint line
+            if (xMetric === "oat" && yMetric === "mat") {
+    const MAT_MIN_SP = Number(currentData.mat_min_setpoint ?? 55);
+    const LOCKOUT_OAT = Number(currentData.econ_lockout_oat ?? 70);
+    const RAT_TEMP = Number(currentData.rat_temp ?? 75);
+
+    return currentData.timestamps.map((_, i) => {
+        const oat = parseFloat(currentData.oat?.[i]);
+        if (!Number.isFinite(oat)) return null;
+
+        let matIdeal;
+        if (oat >= LOCKOUT_OAT) {
+            // Economizer locked out: ideal MAT should move toward return air
+            matIdeal = RAT_TEMP;
+        } else {
+            // Economizer enabled: MAT follows OAT until it hits minimum setpoint
+            matIdeal = Math.max(MAT_MIN_SP, oat);
         }
 
-        function hideError() {
-            document.getElementById('errorMessage').style.display = 'none';
-        }
+        return { x: oat, y: matIdeal };
+    }).filter(p => p !== null);
+}
 
-        function destroyChart() {
-            if (currentChart) {
-                currentChart.destroy();
-                currentChart = null;
+            // Default: use a constant "expected" value for kW/ton; otherwise median of the window
+            let target = null;
+
+            if (yMetric === "kw_ton") {
+                target = 1.0; // <-- demo target for kW/ton
+            } else {
+                const arr = (currentData[yMetric] || []).map(v => parseFloat(v)).filter(v => Number.isFinite(v));
+                if (arr.length === 0) return [];
+                const sorted = [...arr].sort((a, b) => a - b);
+                target = sorted[Math.floor(sorted.length / 2)];
             }
-        }
 
+            return currentData.timestamps.map((timestamp, index) => ({
+                x: xMetric === "timestamps" ? new Date(timestamp) : parseFloat(currentData[xMetric]?.[index]),
+                y: target
+            })).filter(p => (xMetric === "timestamps" || Number.isFinite(p.x)) && Number.isFinite(p.y));
+        }
         function createChart() {
             if (!currentData || !currentData.timestamps || currentData.timestamps.length === 0) {
                 showError('No data available');
@@ -222,13 +320,14 @@
                 x: xMetric === 'timestamps' ? new Date(timestamp) : parseFloat(currentData[xMetric][index]),
                 y: parseFloat(currentData[yMetric][index])
             }));
-
+            const idealOverlay = buildIdealOverlayData(xMetric, yMetric);
             const chartType = xMetric === 'timestamps' ? 'line' : 'scatter';
 
             currentChart = new Chart(ctx, {
                 type: chartType,
                 data: {
-                    datasets: [{
+                    datasets: [
+                    {
                         label: `${metricLabels[yMetric]} vs ${metricLabels[xMetric]}`,
                         data: chartData,
                         borderColor: 'rgb(75, 192, 192)',
@@ -236,7 +335,19 @@
                         pointRadius: xMetric === 'timestamps' ? 3 : 5,
                         showLine: xMetric === 'timestamps',
                         tension: 0.1
-                    }]
+                    },
+                    {
+                        label: "Ideal / Expected",
+                        data: idealOverlay,
+                        borderColor: 'rgba(255, 99, 132, 1)',
+                        backgroundColor: 'rgba(255, 99, 132, 0.0)',
+                        borderDash: [8, 6],
+                        pointRadius: 0,
+                        showLine: true,
+                        tension: 0
+                    }
+                ]
+
                 },
                 options: {
                     responsive: true,
@@ -277,60 +388,84 @@
             });
         }
 
-        async function updateData() {
-            try {
-                const now = Date.now();
-                // Skip update if it's too soon since the last update
-                if (lastUpdateTime && (now - lastUpdateTime) < MIN_UPDATE_INTERVAL) {
-                    return;
-                }
+async function updateData() {
+    try {
+        const now = Date.now();
 
-                const interval = document.getElementById('intervalSelect').value;
-                const response = await fetch(`/data/${interval}`);
+        // Skip update if it's too soon since the last update
+        if (lastUpdateTime && (now - lastUpdateTime) < MIN_UPDATE_INTERVAL) {
+            return;
+        }
 
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
+        const interval = document.getElementById('intervalSelect').value;
+        const response = await fetch(`/data/${interval}`);
 
-                const data = await response.json();
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
 
-                // Update timestamp for rate limiting
-                lastUpdateTime = Date.now();
+        const data = await response.json();
 
-                // Process intervals first
-                if (data.intervals) {
-                    const selectedInterval = document.getElementById('intervalSelect').value;
-                    const intervalIndex = parseInt(selectedInterval.replace('interval', '')) - 1;
-                    let newUpdateInterval = Math.max(data.intervals[intervalIndex] * 1000, MIN_UPDATE_INTERVAL);
+        // Update timestamp for rate limiting
+        lastUpdateTime = Date.now();
 
-                    // Only restart interval if it's different
-                    if (!updateInterval || newUpdateInterval !== updateInterval._interval) {
-                        restartUpdateInterval(newUpdateInterval);
-                    }
-                }
+        // Process intervals first (controls refresh frequency)
+        if (data.intervals) {
+            const selectedInterval = document.getElementById('intervalSelect').value;
+            const intervalIndex = parseInt(selectedInterval.replace('interval', '')) - 1;
+            let newUpdateInterval = Math.max(data.intervals[intervalIndex] * 1000, MIN_UPDATE_INTERVAL);
 
-                // Reverse the data arrays to show chronological order
-                for (let key in data) {
-                    if (Array.isArray(data[key])) {
-                        data[key] = data[key].reverse();
-                    }
-                }
-
-                currentData = data;
-
-                if (!currentData || currentData.timestamps.length === 0) {
-                    showError('No data available');
-                    return;
-                }
-
-                destroyChart();
-                createChart();
-
-            } catch (error) {
-                showError(`Error fetching data: ${error.message}`);
-                console.error('Data fetch error:', error);
+            // Only restart interval if it's different
+            if (!updateInterval || newUpdateInterval !== updateInterval._interval) {
+                restartUpdateInterval(newUpdateInterval);
             }
         }
+
+        // Reverse the data arrays to show chronological order
+        for (let key in data) {
+            if (Array.isArray(data[key])) {
+                data[key] = data[key].reverse();
+            }
+        }
+
+        currentData = data;
+
+        if (!currentData || !currentData.timestamps || currentData.timestamps.length === 0) {
+            showError('No data available');
+            return;
+        }
+
+        // ---- Diagnostics panel (SAFE) ----
+        const sevEl = document.getElementById('diagSeverity');
+        const stateEl = document.getElementById('diagState');
+        const sumEl = document.getElementById('diagSummary');
+        const flagsEl = document.getElementById('diagFlags');
+
+        if (currentData.diagnostics && sevEl && stateEl && sumEl && flagsEl) {
+            sevEl.textContent = currentData.diagnostics.severity ?? "—";
+            stateEl.textContent = currentData.diagnostics.state ?? "—";
+            sumEl.textContent = currentData.diagnostics.summary ?? "—";
+
+            flagsEl.innerHTML = "";
+            const flags = currentData.diagnostics.flags || [];
+            for (const f of flags) {
+                const li = document.createElement('li');
+                li.textContent = `[${f.level}] ${f.code}: ${f.msg}`;
+                flagsEl.appendChild(li);
+            }
+        }
+
+        // ---- Chart refresh (use your existing chart lifecycle) ----
+        destroyChart();
+        createChart();
+
+    } catch (error) {
+        showError(`Error fetching data: ${error.message}`);
+        console.error('Data fetch error:', error);
+    }
+}
+
+
 
         function restartUpdateInterval(interval) {
             if (updateInterval) {
@@ -366,13 +501,75 @@
                     createChart();
                 }
             });
+                        // ---- Scenario selector ----
+            const scenarioSelect = document.getElementById('scenarioSelect');
+            if (scenarioSelect) {
+                scenarioSelect.addEventListener('change', async (e) => {
+                    const name = e.target.value;
+
+                    try {
+                        await fetch("/scenario", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ name })
+                        });
+
+                        const statusEl = document.getElementById('scenarioStatus');
+                        if (statusEl) statusEl.textContent = `Scenario: ${name}`;
+
+                        // Force an immediate refresh so you don't wait for the timer
+                        updateData();
+
+                    } catch (err) {
+                        console.error("Failed to set scenario:", err);
+                        showError(`Failed to set scenario: ${err.message || err}`);
+                    }
+                });
+            }
+            // ---- View preset selector ----
+            const preset = document.getElementById('viewPreset');
+            if (preset) {
+                preset.addEventListener('change', () => {
+                    const v = preset.value;
+                    if (v === "econ_curve") {
+                        // Force MAT vs OAT
+                        document.getElementById('xAxisSelect').value = "oat";
+                        document.getElementById('yAxisSelect').value = "mat";
+
+                        // Redraw immediately
+                        if (currentData) {
+                            destroyChart();
+                            createChart();
+                        } else {
+                            updateData();
+                        }
+                    }
+                });
+            }
+
         }
 
         // Initialize the dashboard
-        document.addEventListener('DOMContentLoaded', () => {
-            setupEventListeners();
-            updateData(); // Initial data load
-        });
+        document.addEventListener('DOMContentLoaded', async () => {
+    setupEventListeners();
+
+    // Initialize scenario selector from backend
+    try {
+        const res = await fetch("/scenario");
+        const data = await res.json();
+        const current = data.scenario || "normal";
+
+        const scenarioSelect = document.getElementById('scenarioSelect');
+        if (scenarioSelect) scenarioSelect.value = current;
+
+        const statusEl = document.getElementById('scenarioStatus');
+        if (statusEl) statusEl.textContent = `Scenario: ${current}`;
+    } catch (e) {
+        console.warn("Could not load current scenario:", e);
+    }
+
+    updateData(); // Initial data load
+});
     </script>
 </body>
 
