@@ -1,3 +1,4 @@
+import MockSensor
 from flask import Flask, render_template, jsonify, request, Response
 import sqlite3
 from datetime import datetime, timedelta
@@ -8,6 +9,26 @@ from Sensor import Sensor
 import math
 import io
 import csv
+import os
+from analysis import diagnose_payload
+
+
+
+DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
+
+def get_sensor():
+    import os
+    demo = os.getenv("DEMO_MODE", "0") == "1"
+
+    if demo:
+        from MockSensor import MockSensor
+        print("DEMO_MODE=1 -> Using MockSensor", flush=True)
+        return MockSensor(lambda: DEMO_SCENARIO["name"])
+
+    else:
+        from Sensor import Sensor
+        print("DEMO_MODE=0 -> Using real Sensor (serial)", flush=True)
+        return Sensor()
 
 #Flask app
 app = Flask(__name__)
@@ -37,16 +58,23 @@ def init_db(): # Initialize the database
     c.execute('CREATE INDEX idx_timestamp_interval ON metrics(timestamp, interval)') # Index for faster queries
 
     c.execute('''CREATE TABLE config
-    (id INTEGER PRIMARY KEY,
-    interval1_seconds INTEGER NOT NULL CHECK(interval1_seconds > 0),
-    interval2_seconds INTEGER NOT NULL CHECK(interval2_seconds > 0),
-    interval3_seconds INTEGER NOT NULL CHECK(interval3_seconds > 0),
-    retention_interval1 INTEGER NOT NULL CHECK(retention_interval1 > 0),
-    retention_interval2 INTEGER NOT NULL CHECK(retention_interval2 > 0),
-    retention_interval3 INTEGER NOT NULL CHECK(retention_interval3 > 0))''') # Configuration table
+(id INTEGER PRIMARY KEY,
+interval1_seconds INTEGER NOT NULL CHECK(interval1_seconds > 0),
+interval2_seconds INTEGER NOT NULL CHECK(interval2_seconds > 0),
+interval3_seconds INTEGER NOT NULL CHECK(interval3_seconds > 0),
+retention_interval1 INTEGER NOT NULL CHECK(retention_interval1 > 0),
+retention_interval2 INTEGER NOT NULL CHECK(retention_interval2 > 0),
+retention_interval3 INTEGER NOT NULL CHECK(retention_interval3 > 0),
+
+-- Economizer curve tuning values (for demo + future real logic)
+mat_min_setpoint REAL NOT NULL,
+econ_lockout_oat REAL NOT NULL,
+rat_temp REAL NOT NULL
+)''')
+
 
     c.execute('''INSERT INTO config VALUES
-    (1, 60, 900, 3600, 1, 7, 30)''') # Default configuration
+    (1, 5, 30, 120, 1, 7, 30, 55.0, 70.0, 75.0)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS calibration_points
         (id INTEGER PRIMARY KEY,
@@ -217,6 +245,20 @@ def add_calibration_point():
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+# ---- Scenario control (demo mode) ----
+import os
+
+DEMO_SCENARIO = {"name": "normal"}  # simple in-memory state
+
+@app.route("/scenario", methods=["GET", "POST"])
+def scenario():
+    global DEMO_SCENARIO
+    if request.method == "POST":
+        data = request.json or {}
+        name = (data.get("name") or "normal").strip().lower()
+        DEMO_SCENARIO["name"] = name
+        return jsonify({"status": "ok", "scenario": DEMO_SCENARIO["name"]})
+    return jsonify({"status": "ok", "scenario": DEMO_SCENARIO["name"]})
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
@@ -289,7 +331,7 @@ def config():
 def collect_data():
     global aggregator 
     SAMPLING_RATE = 1  # seconds
-    sensor = Sensor()
+    sensor = get_sensor()
     aggregator = DataAggregator(SAMPLING_RATE)
     
     last_values = None
@@ -347,8 +389,9 @@ def collect_data():
             try:
                 sensor.close()
                 time.sleep(1)
-                sensor = Sensor()
-            except Exception:
+                sensor = get_sensor()
+            except Exception as e:
+                print("collect_data error:", e, flush=True)
                 time.sleep(5)
         
         time.sleep(SAMPLING_RATE)
@@ -361,48 +404,72 @@ def dashboard():
 def get_data(interval):
     if interval not in ['interval1', 'interval2', 'interval3']:
         return jsonify({"status": "error", "message": "Invalid interval"}), 400
-        
+
     try:
         with sqlite3.connect('metrics.db') as conn:
             c = conn.cursor()
+
+            # Fetch interval timing config
             
-            c.execute('SELECT interval1_seconds, interval2_seconds, interval3_seconds FROM config WHERE id = 1')
-            intervals = c.fetchone()
-            
-            c.execute('''SELECT timestamp, kw_ton, 
-                        ABS(pressure1 - pressure2) as diff_pressure,
-                        ABS(temp1 - temp2) as diff_temp,
-                        cooling_tons,
-                        flow_rate
-                     FROM metrics 
-                     WHERE interval = ? 
-                     ORDER BY timestamp DESC 
-                     LIMIT 500''', (interval,))
-            
-            data = c.fetchall()
-            
-        if not data:
-            return jsonify({
-                'timestamps': [],
-                'kw_ton': [],
-                'diff_pressure': [],
-                'diff_temp': [],
-                'cooling_tons': [],
-                'flow_rate': [],
-                'intervals': intervals
-            })
-        
-        return jsonify({
-            'timestamps': [row[0] for row in data],
-            'kw_ton': [row[1] for row in data],
-            'diff_pressure': [row[2] for row in data],
-            'diff_temp': [row[3] for row in data],
-            'cooling_tons': [row[4] for row in data],
-            'flow_rate': [row[5] for row in data],
+            c.execute(
+                '''SELECT interval1_seconds, interval2_seconds, interval3_seconds,
+                mat_min_setpoint, econ_lockout_oat, rat_temp
+                FROM config WHERE id = 1'''
+            )
+            config_row = c.fetchone() or (60, 900, 3600, 55.0, 70.0, 75.0)
+            intervals = config_row[0:3]
+            mat_min_setpoint, econ_lockout_oat, rat_temp = config_row[3], config_row[4], config_row[5]
+
+            # Fetch most recent metrics for the selected interval (include temp1/temp2 for oat/mat)
+            c.execute(
+                '''
+                SELECT timestamp,
+                       kw_ton,
+                       ABS(pressure1 - pressure2) AS diff_pressure,
+                       ABS(temp1 - temp2) AS diff_temp,
+                       cooling_tons,
+                       flow_rate,
+                       temp1,
+                       temp2
+                FROM metrics
+                WHERE interval = ?
+                ORDER BY timestamp DESC
+                LIMIT 500
+                ''',
+                (interval,)
+            )
+            rows = c.fetchall()
+
+        payload = {
+            'timestamps': [r[0] for r in rows],
+            'kw_ton': [r[1] for r in rows],
+            'diff_pressure': [r[2] for r in rows],
+            'diff_temp': [r[3] for r in rows],
+            'cooling_tons': [r[4] for r in rows],
+            'flow_rate': [r[5] for r in rows],
+            'oat': [r[6] for r in rows],  # temp1 = OAT
+            'mat': [r[7] for r in rows],  # temp2 = MAT
+            'mat_min_setpoint': mat_min_setpoint,
+            'econ_lockout_oat': econ_lockout_oat,
+            'rat_temp': rat_temp,
             'intervals': intervals
-        })
-            
+        }
+
+        # Attach diagnostics, but DO NOT allow it to crash the endpoint
+        try:
+            payload.update(diagnose_payload(payload))
+        except Exception as diag_e:
+            payload['diagnostics'] = {
+                "severity": "WARN",
+                "state": "Diagnostics error",
+                "summary": str(diag_e),
+                "flags": [{"level": "WARN", "code": "DIAG_ERROR", "msg": str(diag_e)}]
+            }
+
+        return jsonify(payload)
+
     except Exception as e:
+        print("get_data error:", repr(e), flush=True)  # ensures you see it even w/ debug=False
         return jsonify({"status": "error", "message": str(e)}), 500
 @app.route('/download')
 def download_data():
